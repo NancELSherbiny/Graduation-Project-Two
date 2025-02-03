@@ -224,5 +224,136 @@ generated_image = pipeline(prompt).images[0]
 generated_image.save("generated_image.png")
 
 
+# Generate Key Frames with Multiple Prompts
+prompts = [
+    "A boy running",
+    "A boy and a girl playing",
+    "a cat next to a girl"
+]
+num_frames_per_prompt = 5
+total_frames = len(prompts) * num_frames_per_prompt
+print("Generating key frames...")
+
+frame_idx = 0
+for prompt in prompts:
+    for i in range(num_frames_per_prompt):
+        frame_prompt = f"{prompt}, frame {i + 1}"
+        with torch.no_grad():
+            image = pipeline(frame_prompt, num_inference_steps=50, height=512, width=512).images[0]
+        frame_path = os.path.join(output_frames_dir, f"frame_{frame_idx:04d}.png")
+        image.save(frame_path)
+        print(f"Saved frame {frame_idx + 1}/{total_frames} at {frame_path}")
+        frame_idx += 1
+        del image
+        torch.cuda.empty_cache()
+
+# Combine frames into a low-FPS video (key frames video)
+key_frames_video = os.path.join(base_dir, "key_frames.mp4")
+print("Creating key frames video...")
+with imageio.get_writer(key_frames_video, fps=5) as writer:
+    for i in range(total_frames):
+        frame_path = os.path.join(output_frames_dir, f"frame_{i:04d}.png")
+        writer.append_data(imageio.imread(frame_path))
+print(f"Key frames video saved at {key_frames_video}")
+
+def interpolate_frames(input_dir, output_dir, exp=4):
+    """
+    Perform interpolation between sequential keyframes and save with ordered naming
+    """
+    print(f"Starting interpolation process...")
+    print(f"Input directory: {input_dir}")
+    print(f"Output directory: {output_dir}")
+
+    # Check if input directory exists
+    if not os.path.exists(input_dir):
+        raise ValueError(f"Input directory '{input_dir}' does not exist!")
+
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Get list of frames and sort them
+    frames = glob(os.path.join(input_dir, "frame_*.png"))
+    if not frames:
+        raise ValueError(f"No frames found in {input_dir}! Looking for files matching 'frame_*.png'")
+
+    frames.sort()
+    print(f"Found {len(frames)} frames: {[os.path.basename(f) for f in frames]}")
+
+    # Counter for final frame naming
+    frame_counter = 0
+
+    # Process each pair of consecutive frames
+    for i in range(len(frames) - 1):
+        frame1 = frames[i]
+        frame2 = frames[i + 1]
+
+        print(f"\nProcessing pair {i}: {os.path.basename(frame1)} → {os.path.basename(frame2)}")
+
+        # Create interpolation command
+        cmd = [
+            sys.executable,  # Use the current Python interpreter
+            "inference_img.py",
+            "--img",
+            frame1,
+            frame2,
+            "--exp",
+            str(exp)
+        ]
+
+        # Remove previous output directory if it exists
+        if os.path.exists('output'):
+            print(f"Cleaning up previous output directory")
+            shutil.rmtree('output')
+
+        # Create fresh output directory
+        os.makedirs('output', exist_ok=True)
+
+        # Run interpolation
+        print(f"Running command: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"Error running inference:")
+                print(f"stdout: {result.stdout}")
+                print(f"stderr: {result.stderr}")
+                raise subprocess.CalledProcessError(result.returncode, cmd)
+        except Exception as e:
+            print(f"Failed to run interpolation: {str(e)}")
+            raise
+
+        # Get all interpolated frames
+        interpolated_frames = sorted(glob(os.path.join("output", "img*.png")))
+        print(f"Generated {len(interpolated_frames)} interpolated frames")
+
+        # Copy and rename each interpolated frame
+        for frame in interpolated_frames:
+            new_name = f"interpolated_{frame_counter:06d}.png"
+            new_path = os.path.join(output_dir, new_name)
+            shutil.copy2(frame, new_path)
+            print(f"Saved {os.path.basename(frame)} as {new_name}")
+            frame_counter += 1
+
+        # Clean up output directory
+        shutil.rmtree('output')
+
+    print(f"\nInterpolation complete! Generated {frame_counter} total frames")
+    return frame_counter
+
+if __name__ == "__main__":
+    # Directory containing your keyframes
+    input_directory = "/content/frames"  # Change this to your input directory
+
+    # Directory where interpolated frames will be saved
+    output_directory = "/content/interpolated_frames"
+
+    # Number of intermediate frames to generate (2^exp - 1 frames between each pair)
+    exp = 4  # This will generate 15 frames between each pair
+
+    try:
+        total_frames = interpolate_frames(input_directory, output_directory, exp)
+        print(f"Successfully created {total_frames} interpolated frames in: {output_directory}")
+    except Exception as e:
+        print(f"Error during interpolation: {str(e)}")
+
 
 
