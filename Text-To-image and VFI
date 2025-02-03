@@ -1,1 +1,228 @@
+# Define model and dataset
+model_id = "CompVis/stable-diffusion-v1-4"
+dataset_name = "nancy9/labels-characters"  # replace with your dataset name
+
+# Load the tokenizer and dataset
+tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+dataset = load_dataset(dataset_name)
+
+# Define the image transformation
+image_transform = transforms.Compose([
+    transforms.Resize((256, 256)),  
+    transforms.ToTensor(),
+    transforms.Normalize([0.5], [0.5])
+])
+
+# Preprocess function
+def preprocess(example):
+    prompt = example['caption']
+    image = example['image']
+
+    # Ensure the image is converted to RGB (some images might be grayscale or have alpha channels)
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    # Apply the transformation
+    image = image_transform(image)
+
+    inputs = tokenizer(prompt, padding="max_length", truncation=True, return_tensors="pt")
+    input_ids = inputs.input_ids.squeeze(0)  # Remove the batch dimension
+    # Return both input_ids and pixel_values as tensors
+    return {"input_ids": input_ids, "pixel_values": image}
+
+# Apply preprocessing
+dataset = dataset.map(preprocess, remove_columns=["caption"])
+half_size = len(dataset["train"]) 
+# Create a Subset for training on half the data
+train_subset = Subset(dataset["train"], range(half_size))  # Use the first half
+# Custom collate function
+def collate_fn(batch):
+    input_ids = [item['input_ids'] for item in batch]
+    pixel_values = [item['pixel_values'] for item in batch]
+
+    # Ensure all items are tensors
+    input_ids = [torch.tensor(item) if not isinstance(item, torch.Tensor) else item for item in input_ids]
+    pixel_values = [torch.tensor(item) if not isinstance(item, torch.Tensor) else item for item in pixel_values]
+
+    # Convert lists to tensors
+    input_ids = torch.stack(input_ids)
+    pixel_values = torch.stack(pixel_values)
+    return {"input_ids": input_ids, "pixel_values": pixel_values}
+    
+
+# Create DataLoader with the subset
+train_dataloader = DataLoader(train_subset, batch_size=2, shuffle=True, collate_fn=collate_fn)
+val_dataloader = DataLoader(dataset['validation'], batch_size=2, shuffle=True, collate_fn=collate_fn)
+test_dataloader = DataLoader(dataset['test'], batch_size=2, shuffle=True, collate_fn=collate_fn)
+
+# Load the pretrained Stable Diffusion model
+text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder")
+vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae")
+unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
+
+# Load the scheduler
+scheduler = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
+
+# Set device (GPU if available)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+text_encoder.to(device)
+vae.to(device)
+unet.to(device)
+
+# Define a custom forward function to use checkpointing
+def custom_forward(*inputs):
+    return unet(*inputs).sample
+
+# Initialize the scaler
+scaler = GradScaler()
+
+# Define the optimizer (using AdamW)
+optimizer = AdamW(
+    [param for name, param in unet.named_parameters() if "out" in name], lr=1e-5
+)  # Adjust learning rate as needed
+
+# Gradient accumulation steps
+accumulation_steps = 8
+
+# Freeze all layers except the output layers
+for name, param in unet.named_parameters():
+    if "out" not in name:
+        param.requires_grad = False
+
+# Early stopping settings
+patience = 3  # Number of epochs to wait for improvement before stopping
+min_delta = 1e-4  # Minimum change in the monitored metric to qualify as improvement
+best_val_loss = np.inf
+early_stop_counter = 0
+
+# Training settings
+num_epochs = 210 
+save_interval = 5 
+unet.train()
+start_epoch = 0
+
+# Check for existing weights to resume training
+for i in range(num_epochs, 0, -1):
+    if os.path.exists(f"lora_weights/unet_weights_epoch_{i+1}.pth"):
+        start_epoch = i + 1
+        print(f"Loading weights from epoch {start_epoch}")
+        unet.load_state_dict(torch.load(f"lora_weights/unet_weights_epoch_{start_epoch}.pth"))
+        break
+
+# Training loop
+for epoch in range(start_epoch, num_epochs):
+    # Training phase
+    progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}")
+    optimizer.zero_grad()
+    epoch_loss = 0.0
+
+    for i, batch in enumerate(progress_bar):
+        # Move batch to device
+        batch = {k: v.to(device) for k, v in batch.items()}
+
+        with autocast():
+            # Forward pass
+            latents = vae.encode(batch["pixel_values"]).latent_dist.sample()
+            latents = latents * vae.config.scaling_factor
+
+            noise = torch.randn_like(latents)
+            timesteps = torch.randint(0, scheduler.num_train_timesteps, (latents.shape[0],), device=device).long()
+            noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+
+            encoder_hidden_states = text_encoder(batch["input_ids"]).last_hidden_state
+
+            # Predict the noise residual using checkpointing
+            noise_pred = checkpoint(custom_forward, noisy_latents, timesteps, encoder_hidden_states)
+
+            # Calculate loss
+            loss = torch.nn.functional.mse_loss(noise_pred, noise)
+
+        scaler.scale(loss).backward()
+
+        # Apply gradients to the optimizer
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+
+        # Accumulate loss
+        epoch_loss += loss.item()
+
+        # Clear variables and cache
+        del latents, noise, noisy_latents, encoder_hidden_states, noise_pred
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # Update progress bar
+        progress_bar.set_postfix(loss=loss.item())
+
+    # Calculate average training loss for the epoch
+    avg_train_loss = epoch_loss / len(train_dataloader)
+    print(f"Epoch {epoch+1}: Average Training Loss: {avg_train_loss:.4f}")
+
+    # Save weights every 'save_interval' epochs
+    if (epoch + 1) % save_interval == 0:
+        os.makedirs("lora_weights", exist_ok=True)
+        save_path = f"lora_weights/unet_weights_epoch_{epoch+1}.pth"
+        torch.save(unet.state_dict(), save_path)
+        print(f"Model weights saved to {save_path}")
+
+    # Validation phase
+    unet.eval()  # Set model to evaluation mode
+    val_loss = 0.0
+    with torch.no_grad():
+        for batch in val_dataloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+
+            with autocast():
+                # Validation steps (similar to training, but no backprop)
+                latents = vae.encode(batch["pixel_values"]).latent_dist.sample()
+                latents = latents * vae.config.scaling_factor
+
+                noise = torch.randn_like(latents)
+                timesteps = torch.randint(0, scheduler.num_train_timesteps, (latents.shape[0],), device=device).long()
+                noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+
+                encoder_hidden_states = text_encoder(batch["input_ids"]).last_hidden_state
+
+                noise_pred = checkpoint(custom_forward, noisy_latents, timesteps, encoder_hidden_states)
+
+                loss = torch.nn.functional.mse_loss(noise_pred, noise)
+                val_loss += loss.item()
+
+    avg_val_loss = val_loss / len(val_dataloader)
+    print(f"Epoch {epoch+1}: Average Validation Loss: {avg_val_loss:.4f}")
+
+    # Set model back to train mode
+    unet.train()
+
+print("Training complete!")
+
+# Assuming vae, text_encoder, unet, scheduler, tokenizer are already defined and loaded
+unet.load_state_dict(torch.load("lora_weights/unet_weights_epoch_210.pth"))
+# Initialize the feature extractor
+feature_extractor = CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32")
+
+# Set safety_checker to None if you don't need it
+safety_checker = None
+
+# Load the fine-tuned model into the pipeline
+pipeline = StableDiffusionPipeline(
+    vae=vae,
+    text_encoder=text_encoder,
+    unet=unet,
+    scheduler=scheduler,
+    tokenizer=tokenizer, 
+    safety_checker=safety_checker,
+    feature_extractor=feature_extractor
+).to(device)
+
+# Define the prompt
+prompt = " boy and girl "
+
+# Generate the image
+generated_image = pipeline(prompt).images[0]
+generated_image.save("generated_image.png")
+
+
+
 
