@@ -20,7 +20,7 @@ pip install torch torchvision transformers datasets diffusers numpy tqdm
 
 ## Model and Dataset
 - **Model**: `CompVis/stable-diffusion-v1-4`
-- **Dataset**: Replace with your dataset (`nancy9/labels-characters` in example)
+- **Dataset**: Replace with your dataset (`nancy9/labels-characters` in example) This is CoDraw dataset we uploaded it on hugging face
 
 ## Preprocessing
 - Tokenizes captions using CLIPTokenizer.
