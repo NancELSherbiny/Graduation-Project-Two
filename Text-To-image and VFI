@@ -355,5 +355,99 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Error during interpolation: {str(e)}")
 
+  # Get all interpolated frames
+        interpolated_frames = sorted(glob(os.path.join("output", "img*.png")))
+        print(f"Generated {len(interpolated_frames)} interpolated frames")
+
+        # Copy and rename each interpolated frame
+        for frame in interpolated_frames:
+            new_name = f"interpolated_{frame_counter:06d}.png"
+            new_path = os.path.join(output_dir, new_name)
+            shutil.copy2(frame, new_path)
+            print(f"Saved {os.path.basename(frame)} as {new_name}")
+            frame_counter += 1
+
+        # Clean up output directory
+        shutil.rmtree('output')
+
+    print(f"\nInterpolation complete! Generated {frame_counter} total frames")
+    return frame_counter
+
+if __name__ == "__main__":
+    # Directory containing your keyframes
+    input_directory = "/content/frames"  # Change this to your input directory
+
+    # Directory where interpolated frames will be saved
+    output_directory = "/content/interpolated_frames"
+
+    # Number of intermediate frames to generate (2^exp - 1 frames between each pair)
+    exp = 4  # This will generate 15 frames between each pair
+
+    try:
+        total_frames = interpolate_frames(input_directory, output_directory, exp)
+        print(f"Successfully created {total_frames} interpolated frames in: {output_directory}")
+    except Exception as e:
+        print(f"Error during interpolation: {str(e)}")
+
+!ffmpeg -r 15 -i /content/interpolated_frames/interpolated_%06d.png -c:v libx264 -pix_fmt yuv420p interpolated_video2.mp4
+
+!python3 inference_video.py --multi=4 --video=/content/key_frames.mp4
+
+def create_video_from_frames(frames_dir, output_path, fps=30):
+    """
+    Create a video from a directory of frames
+    Args:
+        frames_dir: Directory containing the frames
+        output_path: Path where the video will be saved
+        fps: Frames per second for the output video
+    """
+    print(f"Creating video from frames in {frames_dir}")
+
+    # Get all frames
+    frames = glob(os.path.join(frames_dir, "*.png"))
+    if not frames:
+        raise ValueError(f"No frames found in {frames_dir}")
+
+    frames.sort()  # Ensure frames are in order
+    print(f"Found {len(frames)} frames")
+
+    # Read first frame to get dimensions
+    first_frame = cv2.imread(frames[0])
+    height, width, layers = first_frame.shape
+
+    # Define the codec and create VideoWriter object
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # or 'XVID' for AVI
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    # Write frames to video
+    for i, frame_path in enumerate(frames):
+        if i % 100 == 0:  # Progress update every 100 frames
+            print(f"Processing frame {i+1}/{len(frames)}")
+
+        frame = cv2.imread(frame_path)
+        out.write(frame)
+
+    # Release everything when done
+    out.release()
+    print(f"Video saved to {output_path}")
+    print(f"Video duration: {len(frames)/fps:.2f} seconds")
+
+if __name__ == "__main__":
+    # Directory containing all frames (interpolated and original)
+    frames_directory = "/content/interpolated_frames"
+
+    # Output video path
+    output_video = "output_video.mp4"
+
+    # Frames per second (adjust this to control video speed)
+    fps = 30
+
+    try:
+        create_video_from_frames(frames_directory, output_video, fps)
+    except Exception as e:
+        print(f"Error creating video: {str(e)}")
+
+
+
 
 
