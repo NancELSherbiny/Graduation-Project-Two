@@ -1,3 +1,4 @@
+# results of Translating CoDraw dataset
 import pandas as pd
 from transformers import T5ForConditionalGeneration, T5Tokenizer
 
